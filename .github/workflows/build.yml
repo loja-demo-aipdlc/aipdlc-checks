@@ -1,0 +1,68 @@
+# Builder confiável da Loja Demo (CORE-14). Os repositórios de produção chamam este workflow; quem assina a
+# proveniência é ESTE arquivo (o "signer workflow" da atestação), e não o workflow do repositório que chama.
+# Por isso a verificação aceita só artefatos assinados daqui: o repositório de produção não consegue forjar a
+# proveniência mudando o próprio workflow.
+#
+# Garantias:
+#   - roda só no branch principal do repositório que chama (recusa qualquer outro ref);
+#   - constrói e publica a imagem; não roda testes nem hooks depois do build;
+#   - a proveniência (SLSA v1) é gerada e assinada pelo GitHub (Sigstore), fora do alcance dos passos do build.
+# Antes de usar fora da demo, fixe cada action pelo SHA completo do commit.
+name: builder confiável
+
+on:
+  workflow_call:
+    outputs:
+      image:
+        description: Nome da imagem no GHCR, sem tag
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: Digest da imagem publicada (sha256:...)
+        value: ${{ jobs.build.outputs.digest }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Só o branch principal
+        if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          echo "::error::o builder só constrói o branch principal (ref: $GITHUB_REF)"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Construir e publicar no GHCR
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --pull --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$image:$GITHUB_SHA" .
+          docker push "$image:$GITHUB_SHA"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | cut -d@ -f2)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### Imagem publicada" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$image@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Proveniência assinada pela plataforma
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.push.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
