@@ -30,7 +30,7 @@ concurrency:
 
 env:
   ENGINE_REPO: gabrielmissio/ai-pdlc
-  ENGINE_SHA: "beb0a3d0f21be6d5f63800c3d0b2bf464c28cce5"  # gabrielmissio/ai-pdlc#24
+  ENGINE_SHA: "759b67c5580eeb0d3bc86692230a896ebddb554e"  # gabrielmissio/ai-pdlc#26
   FUNCTION: aipdlc-verify
   AWS_REGION: us-east-1
 
