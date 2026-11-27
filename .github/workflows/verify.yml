@@ -1,0 +1,70 @@
+# Identidade de verificação da Loja Demo (CORE-02, CORE-33; ROADMAP F0, achado A-04).
+#
+# Required workflow: o ruleset da organização exige ESTE arquivo, deste repositório, em todo PR do perímetro. Um
+# workflow criado num branch de um repositório de produto não satisfaz a regra, ao contrário do check por nome
+# publicado pelo app GitHub Actions, que qualquer workflow do repositório consegue publicar.
+#
+# O motor fica no repositório privado ai-pdlc (NDA) e é baixado pelo SHA fixado em ENGINE_SHA. Trocar a versão do
+# motor é um PR neste repositório, com o quórum de governança (duas aprovações além do autor).
+#
+# Garantias:
+#   - nunca faz checkout nem executa código do PR: lê o PR, as reviews, as issues e as políticas pela API;
+#   - o job falha quando o motor bloqueia: o resultado do próprio job é o gate;
+#   - durante a transição, publica também o check "aipdlc", que os rulesets de cada repositório ainda exigem.
+#
+# Required workflows só disparam em eventos de PR. Uma review não os dispara: o aipdlc-review.yml de cada
+# repositório reexecuta este workflow quando chega uma review (a reexecução roda este mesmo arquivo).
+# Antes de usar fora da demo, fixe cada action pelo SHA completo do commit.
+name: aipdlc-verify
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read          # triagem g1-t: issues e eventos de label (G1-T)
+  checks: write         # check "aipdlc" da transição
+
+concurrency:
+  group: aipdlc-verify-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  ENGINE_REPO: gabrielmissio/ai-pdlc
+  ENGINE_SHA: "2d290c2d798fd547b6caa600d369598e638cd40e"  # gabrielmissio/ai-pdlc#20
+
+jobs:
+  verify:
+    name: aipdlc-verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Motor dos checks, pelo SHA fixado (somente leitura)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_SHA }}
+          token: ${{ secrets.AIPDLC_ENGINE_TOKEN }}
+          path: engine
+          persist-credentials: false
+
+      - name: Conferir o SHA do motor
+        run: test "$(git -C engine rev-parse HEAD)" = "$ENGINE_SHA"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependências fixadas
+        run: pip install -q -r engine/requirements.txt
+
+      - name: Avaliar o PR (o job falha quando bloqueia)
+        working-directory: engine/examples/loja-demo/repos/aipdlc-checks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: python -m aipdlc check-run --repo "$REPO" --numero "$PR" --sha "$SHA" --falhar-se-bloqueado
