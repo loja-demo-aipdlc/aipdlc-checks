@@ -1,0 +1,139 @@
+# Deploy da identidade de verificação (ROADMAP F0; CORE-02, CORE-33; achados A-04 e A-12).
+#
+# O check obrigatório "aipdlc" é publicado pelo GitHub App aipdlc-verify, cujo webhook chega a um Lambda. Este
+# workflow é o ÚNICO caminho para trocar o código desse Lambda: só roda no branch principal deste repositório
+# (mudança aqui exige duas aprovações além do autor), no environment verificacao, cuja role AWS só aceita este
+# repositório e este environment.
+#
+# Garantias:
+#   - o motor vem do repositório privado ai-pdlc no ENGINE_SHA fixado abaixo, conferido depois do checkout;
+#   - a imagem é um manifest único linux/amd64, publicada no ECR privado com tag imutável;
+#   - a proveniência é assinada pelo GitHub (Sigstore) com a identidade DESTE workflow;
+#   - a versão nova do Lambda é conferida pelo digest antes de o alias live apontar para ela, e o teste confere que
+#     a função recusa um webhook sem assinatura; se falhar, o alias volta para a versão anterior.
+# O rodapé de cada check diz a versão do Lambda e o ENGINE_SHA: o que roda é comparável ao commit aprovado.
+# Antes de usar fora da demo, fixe cada action pelo SHA completo do commit.
+name: verify-deploy
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-deploy.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-deploy
+  cancel-in-progress: false
+
+env:
+  ENGINE_REPO: gabrielmissio/ai-pdlc
+  ENGINE_SHA: "4841d592aeff26d54e7febd6a5b685d05c4fe673"  # gabrielmissio/ai-pdlc#21
+  FUNCTION: aipdlc-verify
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: verificacao
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Motor dos checks, pelo SHA fixado
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_SHA }}
+          token: ${{ secrets.AIPDLC_ENGINE_TOKEN }}
+          persist-credentials: false
+
+      - name: Conferir o SHA do motor
+        run: test "$(git rev-parse HEAD)" = "$ENGINE_SHA"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construir e publicar no ECR
+        id: push
+        run: |
+          repo="${{ steps.ecr.outputs.registry }}/$FUNCTION"
+          tag="motor-${ENGINE_SHA:0:12}-${GITHUB_RUN_ID}"
+          docker buildx build --pull --platform linux/amd64 --provenance=false --sbom=false \
+            -f examples/loja-demo/repos/aipdlc-checks/Dockerfile.verify --build-arg ENGINE_SHA="$ENGINE_SHA" \
+            -t "$repo:$tag" --push --metadata-file meta.json .
+          digest=$(jq -r '."containerimage.digest"' meta.json)
+          media=$(jq -r '."containerimage.descriptor".mediaType' meta.json)
+          [ "$media" = "application/vnd.oci.image.manifest.v1+json" ] || [ "$media" = "application/vnd.docker.distribution.manifest.v2+json" ] \
+            || { echo "::error::esperado manifest único, veio $media"; exit 1; }
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### Imagem: \`$repo@$digest\` (motor \`$ENGINE_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Proveniência assinada por este workflow
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.push.outputs.repo }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+
+      - name: Função existe?
+        id: fn
+        run: |
+          if aws lambda get-function --function-name "$FUNCTION" >/dev/null 2>&1; then
+            echo "existe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "existe=false" >> "$GITHUB_OUTPUT"
+            echo "Função ainda não existe: rode a fase 2 do stack com ImageDigest=${{ steps.push.outputs.digest }}" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Versão nova, com o digest conferido
+        id: versao
+        if: steps.fn.outputs.existe == 'true'
+        env:
+          IMAGE: ${{ steps.push.outputs.repo }}@${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          aws lambda update-function-code --function-name "$FUNCTION" --image-uri "$IMAGE" >/dev/null
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+          v=$(aws lambda publish-version --function-name "$FUNCTION" \
+              --description "motor ${ENGINE_SHA:0:12} ${DIGEST:0:19}" --query Version --output text)
+          got=$(aws lambda get-function --function-name "$FUNCTION" --qualifier "$v" \
+                --query Code.ResolvedImageUri --output text)
+          [ "${got##*@}" = "$DIGEST" ] || { echo "::error::a versão $v roda ${got##*@}, esperado $DIGEST"; exit 1; }
+          echo "versao=$v" >> "$GITHUB_OUTPUT"
+          echo "anterior=$(aws lambda get-alias --function-name "$FUNCTION" --name live \
+                --query FunctionVersion --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Alias live na versão nova, com teste e volta automática
+        if: steps.fn.outputs.existe == 'true'
+        env:
+          NOVA: ${{ steps.versao.outputs.versao }}
+          ANTERIOR: ${{ steps.versao.outputs.anterior }}
+          URL: ${{ vars.VERIFY_URL }}
+        run: |
+          aws lambda update-alias --function-name "$FUNCTION" --name live --function-version "$NOVA" >/dev/null
+          # Webhook sem assinatura: a função nova tem de responder 401 (sobe, lê o segredo e recusa)
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-GitHub-Event: ping' -d '{}' "$URL") || true
+            [ "$code" = "401" ] && break
+            sleep 5
+          done
+          if [ "$code" != "401" ]; then
+            echo "::error::esperado 401 sem assinatura, veio $code; alias volta para $ANTERIOR"
+            aws lambda update-alias --function-name "$FUNCTION" --name live --function-version "$ANTERIOR" >/dev/null
+            exit 1
+          fi
+          echo "### live → versão $NOVA (antes: $ANTERIOR)" >> "$GITHUB_STEP_SUMMARY"

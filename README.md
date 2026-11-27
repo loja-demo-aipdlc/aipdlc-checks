@@ -15,9 +15,8 @@ Mudança aqui muda o que a empresa considera build confiável: exige duas aprova
 
 ## Identidade de verificação
 
-`.github/workflows/verify.yml` é o **required workflow** que o ruleset da organização exige em todo PR do
-perímetro (CORE-02). Ele baixa o motor dos checks pelo SHA fixado em `ENGINE_SHA`, avalia o PR pela API, sem
-executar código do PR, e falha quando bloqueia. Um workflow criado num branch de outro repositório não satisfaz a
-regra. Trocar a versão do motor é um PR aqui, com duas aprovações além do autor.
-
-Uma review não dispara required workflows: o `aipdlc-review.yml` de cada repositório reexecuta o `aipdlc-verify`.
+O check obrigatório `aipdlc` é publicado pelo GitHub App `aipdlc-verify`, cujo webhook chega a um Lambda na AWS
+(CORE-02). `.github/workflows/verify-deploy.yml` é o único caminho para trocar o código desse Lambda: ele baixa o
+motor do repositório privado `ai-pdlc` pelo `ENGINE_SHA` fixado, constrói a imagem, assina a proveniência e
+implanta pelo digest, no environment `verificacao` (CORE-33). Trocar a versão do motor é um PR aqui, com duas
+aprovações além do autor.
